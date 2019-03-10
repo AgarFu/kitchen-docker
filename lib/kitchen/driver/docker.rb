@@ -22,6 +22,7 @@ require 'net/ssh'
 require 'tempfile'
 require 'shellwords'
 require 'base64'
+require 'docker'
 
 require 'kitchen/driver/base'
 
@@ -35,7 +36,6 @@ module Kitchen
     class Docker < Kitchen::Driver::Base
       include ShellOut
 
-      default_config :binary,        'docker'
       default_config :socket,        ENV['DOCKER_HOST'] || 'unix:///var/run/docker.sock'
       default_config :privileged,    false
       default_config :cap_add,       nil
@@ -87,20 +87,11 @@ module Kitchen
 
       MUTEX_FOR_SSH_KEYS = Mutex.new
 
-      def verify_dependencies
-        run_command("#{config[:binary]} >> #{dev_null} 2>&1", quiet: true, use_sudo: config[:use_sudo])
-        rescue
-          raise UserError,
-          'You must first install the Docker CLI tool http://www.docker.io/gettingstarted/'
-      end
-
-      def dev_null
-        case RbConfig::CONFIG["host_os"]
-        when /mswin|msys|mingw|cygwin|bccwin|wince|emc/
-          "NUL"
-        else
-          "/dev/null"
-        end
+      def initialize(config = {})
+        super
+        @docker_api = ::Docker::Connection.new(config[:socket], {})
+        ::Docker.logger = logger
+        info("Docker API connection: #{@docker_api}")
       end
 
       def default_image
@@ -136,10 +127,17 @@ module Kitchen
       end
 
       def destroy(state)
-        rm_container(state) if container_exists?(state)
-        if config[:remove_images] && state[:image_id]
-          rm_image(state) if image_exists?(state)
-        end
+        begin
+          ::Docker::Container.get(state[:container_id], {}, @docker_api).remove(:force => true)
+        rescue ::Docker::Error::NotFoundError => ex
+          info(ex.to_s)
+        end if state[:container_id]
+
+        begin
+          ::Docker::Image.get(state[:image_id], {}, @docker_api).remove()
+        rescue ::Docker::Error::NotFoundError => ex
+          info(ex.to_s)
+        end if config[:remove_images] && state[:image_id]
       end
 
       def remote_socket?
@@ -150,21 +148,6 @@ module Kitchen
 
       def socket_uri
         URI.parse(config[:socket])
-      end
-
-      def docker_command(cmd, options={})
-        docker = config[:binary].dup
-        docker << " -H #{config[:socket]}" if config[:socket]
-        docker << " --tls" if config[:tls]
-        docker << " --tlsverify" if config[:tls_verify]
-        docker << " --tlscacert=#{config[:tls_cacert]}" if config[:tls_cacert]
-        docker << " --tlscert=#{config[:tls_cert]}" if config[:tls_cert]
-        docker << " --tlskey=#{config[:tls_key]}" if config[:tls_key]
-        run_command("#{docker} #{cmd}", options.merge({
-          quiet: !logger.debug?,
-          use_sudo: config[:use_sudo],
-          log_subject: Thor::Util.snake_case(self.class.to_s),
-        }))
       end
 
       def generate_keys
@@ -298,92 +281,59 @@ module Kitchen
         end
       end
 
-      def parse_image_id(output)
-        output.each_line do |line|
-          if line =~ /image id|build successful|successfully built/i
-            return line.split(/\s+/).last
-          end
-        end
-        raise ActionFailed,
-          'Could not parse Docker build output for image ID'
-      end
-
       def build_image(state)
-        cmd = "build"
-        cmd << " --no-cache" unless config[:use_cache]
-        extra_build_options = config_to_options(config[:build_options])
-        cmd << " #{extra_build_options}" unless extra_build_options.empty?
-        dockerfile_contents = dockerfile
-        build_context = config[:build_context] ? '.' : '-'
-        file = Tempfile.new('Dockerfile-kitchen', Dir.pwd)
-        output = begin
-          file.write(dockerfile)
-          file.close
-          docker_command("#{cmd} -f #{Shellwords.escape(dockerfile_path(file))} #{build_context}", :input => dockerfile_contents)
-        ensure
-          file.close unless file.closed?
-          file.unlink
-        end
-        parse_image_id(output)
+        #build_context = config[:build_context] ? '.' : '-'
+        options = {
+          :nocache => config[:use_cache]
+        }
+        options = options.merge(config[:build_options]) unless config[:build_options].nil?
+        # https://github.com/swipely/docker-api/blob/fc7ad57f77d59036dba9598ed52772778dc198c6/lib/docker/image.rb#L289 build_from_dir
+        ::Docker::Image.build(dockerfile, options) do |v|
+          ::Docker::Util.fix_json(v).each { |log| info(log['stream'].strip) }
+        end.id
       end
 
-      def parse_container_id(output)
-        container_id = output.chomp
-        unless [12, 64].include?(container_id.size)
-          raise ActionFailed,
-          'Could not parse Docker run output for container ID'
-        end
-        container_id
-      end
+      def build_run_options
+        options = {}
+        options['name'] = config[:instance_name] if config[:instance_name]
+        options['Hostname'] = config[:hostname] if config[:hostname]
+        options['Env'] = []
+        options['Env'] << "http_proxy=#{config[:http_proxy]}" if config[:http_proxy]
+        options['Env'] << "https_proxy=#{config[:https_proxy]}" if config[:https_proxy]
+        options['HostConfig'] = {}
+        options['HostConfig']['PublishAllPorts'] = config[:publish_all]
+        options['HostConfig']['Memory'] = config[:memory] if config[:memory]
+        options['HostConfig']['CpuShares'] = config[:cpu] if config[:cpu]
+        options['HostConfig']['Privileged'] = config[:privileged]
+        options['HostConfig']['PortBindings'] = {}
 
-      def build_run_command(image_id)
-        cmd = "run -d -p 22"
-        Array(config[:forward]).each {|port| cmd << " -p #{port}"}
-        Array(config[:dns]).each {|dns| cmd << " --dns #{dns}"}
-        Array(config[:add_host]).each {|host, ip| cmd << " --add-host=#{host}:#{ip}"}
-        Array(config[:volume]).each {|volume| cmd << " -v #{volume}"}
-        Array(config[:volumes_from]).each {|container| cmd << " --volumes-from #{container}"}
-        Array(config[:links]).each {|link| cmd << " --link #{link}"}
-        Array(config[:devices]).each {|device| cmd << " --device #{device}"}
-        cmd << " --name #{config[:instance_name]}" if config[:instance_name]
-        cmd << " -P" if config[:publish_all]
-        cmd << " -h #{config[:hostname]}" if config[:hostname]
-        cmd << " -m #{config[:memory]}" if config[:memory]
-        cmd << " -c #{config[:cpu]}" if config[:cpu]
-        cmd << " -e http_proxy=#{config[:http_proxy]}" if config[:http_proxy]
-        cmd << " -e https_proxy=#{config[:https_proxy]}" if config[:https_proxy]
-        cmd << " --privileged" if config[:privileged]
-        Array(config[:cap_add]).each {|cap| cmd << " --cap-add=#{cap}"} if config[:cap_add]
-        Array(config[:cap_drop]).each {|cap| cmd << " --cap-drop=#{cap}"} if config[:cap_drop]
-        Array(config[:security_opt]).each {|opt| cmd << " --security-opt=#{opt}"} if config[:security_opt]
-        extra_run_options = config_to_options(config[:run_options])
-        cmd << " #{extra_run_options}" unless extra_run_options.empty?
-        cmd << " #{image_id} #{config[:run_command]}"
-        cmd
+        options['ExposedPorts'] = {}
+        options['ExposedPorts']['22/tcp'] = {}
+        options['HostConfig']['PortBindings']['22/tcp'] = [{}]
+        # FIXME: add support for syntax porA:portB
+        Array(config[:forward]).each do |port| 
+          options['ExposedPorts']["#{port}/tcp"] = {}
+          options['HostConfig']['PortBindings']["#{port}/tcp"] = [{}]
+        end unless config[:forward].nil?
+
+        options['HostConfig']['Dns'] = Array(config[:dns]) unless config[:dns].nil?
+        options['HostConfig']['ExtraHosts'] = Array(config[:add_host]) unless config[:add_host].nil?
+        options['HostConfig']['VolumesFrom'] = Array(config[:volumes_from]) unless config[:volumes_from].nil?
+        Array(config[:volumes]).each {|volume| options['Volumes'][volume] = {} }
+        options['HostConfig']['Links'] = Array(config[:links]) unless config[:links].nil?
+        Array(config[:devices]).each {|device| options['HostConfig']['Devices'][volume] = { 'PathOnHost' => device, 'PathInContainer' => device, 'CgroupPermissions' => 'mrw'} }
+        options['HostConfig']['CapAdd'] = Array(config[:cap_add]) unless config[:cap_add].nil?
+        options['HostConfig']['CapDrop'] = Array(config[:cap_drop]) unless config[:cap_drop].nil?
+        options['HostConfig']['SecurityOpt'] = Array(config[:security_opt]) unless config[:security_opt].nil?
+        options = options.merge(config[:run_options]) unless config[:run_options].nil?
+        options
       end
 
       def run_container(state)
-        cmd = build_run_command(state[:image_id])
-        output = docker_command(cmd)
-        parse_container_id(output)
-      end
-
-      def container_exists?(state)
-        state[:container_id] && !!docker_command("top #{state[:container_id]}") rescue false
-      end
-
-      def image_exists?(state)
-        state[:image_id] && !!docker_command("docker inspect --type=image #{state[:image_id]}") rescue false
-      end
-
-      def parse_container_ssh_port(output)
-        begin
-          _host, port = output.split(':')
-          port.to_i
-        rescue
-          raise ActionFailed,
-            'Could not parse Docker port output for container SSH port'
-        end
+        ::Docker::Image.get(state[:image_id]).run(
+          config[:run_command],
+          build_run_options
+        ).id
       end
 
       def container_ssh_port(state)
@@ -391,8 +341,8 @@ module Kitchen
           if config[:use_internal_docker_network]
             return 22
           end
-          output = docker_command("port #{state[:container_id]} 22/tcp")
-          parse_container_ssh_port(output)
+          ::Docker::Container.get(state[:container_id], {}, @docker_api)
+            .info['NetworkSettings']['Ports']['22/tcp'][0]['HostPort']
         rescue
           raise ActionFailed,
           'Docker reports container has no ssh port mapped'
@@ -401,49 +351,17 @@ module Kitchen
 
       def container_ip(state)
         begin
-          cmd = "inspect --format '{{ .NetworkSettings.IPAddress }}'"
-          cmd << " #{state[:container_id]}"
-          docker_command(cmd).strip
+          ::Docker::Container.get(state[:container_id], {}, @docker_api)
+            .info['NetworkSettings']['IPAddress']
         rescue
           raise ActionFailed,
           'Error getting internal IP of Docker container'
         end
       end
 
-      def rm_container(state)
-        container_id = state[:container_id]
-        docker_command("stop -t 0 #{container_id}")
-        docker_command("rm #{container_id}")
-      end
-
-      def rm_image(state)
-        image_id = state[:image_id]
-        docker_command("rmi #{image_id}")
-      end
-
-      # Convert the config input for `:build_options` or `:run_options` in to a
-      # command line string for use with Docker.
-      #
-      # @since 2.5.0
-      # @param config [nil, String, Array, Hash] Config data to convert.
-      # @return [String]
-      def config_to_options(config)
-        case config
-        when nil
-          ''
-        when String
-          config
-        when Array
-          config.map {|c| config_to_options(c) }.join(' ')
-        when Hash
-          config.map {|k, v| Array(v).map {|c| "--#{k}=#{Shellwords.escape(c)}" }.join(' ') }.join(' ')
-        end
-      end
-
       def dockerfile_path(file)
         config[:build_context] ? Pathname.new(file.path).relative_path_from(Pathname.pwd).to_s : file.path
       end
-
     end
   end
 end
